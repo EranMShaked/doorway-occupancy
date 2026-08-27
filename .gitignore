@@ -1,0 +1,15 @@
+*.env
+.deployed-ids
+config.local.yml
+
+# frigate runtime
+storage/
+*.db
+*.db-shm
+*.db-wal
+model_cache/
+
+# recordings and stills never belong in here
+*.mp4
+*.jpg
+*.png

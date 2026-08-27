@@ -1,0 +1,92 @@
+# Copy to config/config.yml and fill in the camera credentials.
+# Tested against Frigate 0.17.2.
+
+mqtt:
+  enabled: false
+
+detectors:
+  ov:
+    type: openvino
+    device: GPU
+
+# Must be top level. Nesting this under the detector is accepted without
+# error and then ignored, which leaves the detector feeding 320x320 into a
+# 300x300 model and crash-looping once a minute.
+model:
+  path: /openvino-model/ssdlite_mobilenet_v2.xml
+  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
+  width: 300
+  height: 300
+  input_tensor: nhwc
+  input_pixel_format: bgr
+  model_type: ssd
+
+go2rtc:
+  streams:
+    frontdoor:
+      - rtsp://USERNAME:PASSWORD@CAMERA_IP:554/avn=1
+
+cameras:
+  frontdoor:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/frontdoor
+          roles:
+            - detect
+            - record
+    detect:
+      enabled: true
+      width: 352
+      height: 288
+      fps: 5
+
+    # Most cameras burn a clock into the video. The seconds digit changes
+    # every frame, so without this the detector never idles.
+    motion:
+      mask:
+        - 0.28,0.87,0.90,0.87,0.90,1,0.28,1
+
+    objects:
+      track:
+        - person
+      filters:
+        person:
+          threshold: 0.7
+          min_score: 0.5
+
+    snapshots:
+      enabled: true
+      timestamp: true
+      bounding_box: true
+      retain:
+        default: 14
+
+    # record.retain was removed in 0.17. Leaving it in drops Frigate into
+    # safe mode, where the API returns an empty camera list and otherwise
+    # looks fine.
+    record:
+      enabled: true
+      continuous:
+        days: 0
+      motion:
+        days: 3
+      alerts:
+        retain:
+          days: 14
+      detections:
+        retain:
+          days: 14
+
+    # Vertical split of the frame. doorway is the door itself, approach is
+    # the hallway leading to it. Zone membership uses the bounding box
+    # bottom-centre point, so these only need to be right at floor level.
+    zones:
+      doorway:
+        coordinates: 0,0.30,0.62,0.30,0.62,1,0,1
+        objects:
+          - person
+      approach:
+        coordinates: 0.62,0.15,1,0.15,1,1,0.62,1
+        objects:
+          - person
