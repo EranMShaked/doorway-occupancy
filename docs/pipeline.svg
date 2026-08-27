@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 240" width="760" height="240" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+  <rect width="760" height="240" fill="#F6F7F9"/>
+  <defs>
+    <marker id="p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8A94A0"/>
+    </marker>
+  </defs>
+
+  <g fill="#FFFFFF" stroke="#D5DBE2" stroke-width="1.5">
+    <rect x="24" y="62" width="118" height="58" rx="5"/>
+    <rect x="182" y="62" width="118" height="58" rx="5"/>
+    <rect x="340" y="62" width="118" height="58" rx="5"/>
+    <rect x="498" y="62" width="118" height="58" rx="5"/>
+    <rect x="640" y="62" width="96" height="58" rx="5"/>
+  </g>
+
+  <g font-size="13" font-weight="600" fill="#1F2A35" text-anchor="middle">
+    <text x="83" y="86">Camera</text>
+    <text x="241" y="86">go2rtc</text>
+    <text x="399" y="86">Frigate</text>
+    <text x="557" y="86">n8n</text>
+    <text x="688" y="86">Gotify</text>
+  </g>
+  <g font-size="11" fill="#61707E" text-anchor="middle">
+    <text x="83" y="104">RTSP, 352x288</text>
+    <text x="241" y="104">one connection</text>
+    <text x="399" y="104">detect on motion</text>
+    <text x="557" y="104">direction + count</text>
+    <text x="688" y="104">push to phone</text>
+  </g>
+
+  <g stroke="#8A94A0" stroke-width="1.5" marker-end="url(#p)">
+    <line x1="146" y1="91" x2="176" y2="91"/>
+    <line x1="304" y1="91" x2="334" y2="91"/>
+    <line x1="462" y1="91" x2="492" y2="91"/>
+    <line x1="620" y1="91" x2="636" y2="91"/>
+  </g>
+
+  <text x="399" y="34" font-size="12.5" fill="#61707E" text-anchor="middle">person events and a timeline of positions</text>
+  <path d="M 399 42 L 399 58" stroke="#8A94A0" stroke-width="1.5" marker-end="url(#p)"/>
+
+  <path d="M 557 124 L 557 152" stroke="#8A94A0" stroke-width="1.5" marker-end="url(#p)"/>
+  <rect x="440" y="152" width="234" height="60" rx="5" fill="#FFFFFF" stroke="#D5DBE2" stroke-width="1.5"/>
+  <text x="457" y="173" font-size="11.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" fill="#2F5D91">GET /occupancy</text>
+  <text x="457" y="192" font-size="11.5" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" fill="#2F5D91">GET /occupancy/reset</text>
+  <text x="457" y="207" font-size="10.5" fill="#8A94A0">read the count, or correct it by hand</text>
+
+  <text x="24" y="176" font-size="11.5" fill="#61707E">n8n polls every 10s.</text>
+  <text x="24" y="194" font-size="11.5" fill="#61707E">No MQTT broker needed.</text>
+</svg>
