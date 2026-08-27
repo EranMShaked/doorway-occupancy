@@ -13,3 +13,6 @@ model_cache/
 *.mp4
 *.jpg
 *.png
+
+# personal
+TODO.md
