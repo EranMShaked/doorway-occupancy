@@ -1,0 +1,404 @@
+{
+  "name": "Frontdoor Occupancy (Frigate -> Gotify)",
+  "nodes": [
+    {
+      "id": "87627bf4-1104-4e30-a8ca-6f1a169f7666",
+      "name": "Every 10 Seconds",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -680,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 10
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "81060779-4009-46bd-8459-e8616c31436f",
+      "name": "Build Poll Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        0
+      ],
+      "notes": "Reads/advances staticData.lastSeenTs. Applies a 30s overlap so events that were still open (end_time null) on the previous poll get re-fetched once they complete; id-based dedupe downstream guarantees they are never double-counted.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst nowSec = Math.floor(Date.now() / 1000);\n\nif (staticData.lastSeenTs === undefined || staticData.lastSeenTs === null) {\n  // First run ever: look back 5 minutes so we don't miss events that fired\n  // while this workflow was being set up.\n  staticData.lastSeenTs = nowSec - 300;\n}\n\nconst OVERLAP_SECONDS = 30;\nconst after = Math.max(0, staticData.lastSeenTs - OVERLAP_SECONDS);\n\nreturn [\n  {\n    json: {\n      camera: 'frontdoor',\n      label: 'person',\n      after,\n      limit: 50,\n    },\n  },\n];\n"
+      }
+    },
+    {
+      "id": "6c398aa1-d65c-4aa5-b6d3-22aea1eb588d",
+      "name": "Fetch Frigate Events",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -200,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "http://172.17.0.1:5000/api/events",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "camera",
+              "value": "={{ $json.camera }}"
+            },
+            {
+              "name": "label",
+              "value": "={{ $json.label }}"
+            },
+            {
+              "name": "after",
+              "value": "={{ $json.after }}"
+            },
+            {
+              "name": "limit",
+              "value": "={{ $json.limit }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a1b2c3d4-0001-4a00-9000-000000000001",
+      "name": "Prepare New Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        0
+      ],
+      "notes": "Advances the lastSeenTs cursor and filters to completed, not-yet-processed events, one item per event. This is the same cursor/dedupe logic that used to live at the top of the old 'Classify, Dedupe & Count' node -- unchanged behavior, just split out so each new event can be routed through its own 'Fetch Timeline' call before classification.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\n\nstaticData.processedIds = staticData.processedIds || [];\n\n// Flatten HTTP Request output defensively: n8n may split a JSON-array\n// response into one item per element, or return the whole array as one item.\nconst rawItems = $input.all().map((i) => i.json);\nlet events = [];\nfor (const item of rawItems) {\n  if (Array.isArray(item)) events.push(...item);\n  else if (item && typeof item === 'object') events.push(item);\n}\n\n// Advance the poll cursor using every fetched event's start_time, even ones\n// we don't classify yet, so the window doesn't stall on a persistently-open\n// event. The 30s overlap applied in \"Build Poll Query\" plus id-based dedupe\n// downstream means this is safe.\nfor (const ev of events) {\n  const ts = ev.start_time != null ? ev.start_time : 0;\n  if (staticData.lastSeenTs === undefined || ts > staticData.lastSeenTs) {\n    staticData.lastSeenTs = ts;\n  }\n}\n\n// Only carry forward COMPLETED events (end_time set) not already processed by id.\nconst processedSet = new Set(staticData.processedIds);\nconst newEvents = events\n  .filter((ev) => ev && ev.id != null && ev.end_time != null && !processedSet.has(ev.id))\n  .sort((a, b) => (a.start_time || 0) - (b.start_time || 0));\n\n// One item per new event -- each becomes a separate \"Fetch Timeline\" call.\n// Downstream nodes must locate the source event via pairedItem, not array\n// index/order (see \"Fetch Timeline\" node notes).\nreturn newEvents.map((ev) => ({ json: ev }));\n"
+      }
+    },
+    {
+      "id": "a1b2c3d4-0002-4a00-9000-000000000002",
+      "name": "Fetch Timeline",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        300,
+        0
+      ],
+      "notes": "Runs once per new event (one input item per event from 'Prepare New Events'). options.response.response.fullResponse=true is REQUIRED: verified empirically that without it, n8n's HTTP Request node auto-splits each event's N-entry timeline JSON array into N separate output items with sequential/bogus pairedItem indices, which silently mismatches timeline entries to the wrong event whenever 2+ events are in flight in the same poll. With fullResponse:true, this node emits exactly one output item per input item (body holds the raw timeline array), and pairedItem.item correctly indexes back into 'Prepare New Events' -- used downstream in 'Classify, Dedupe & Count'.",
+      "parameters": {
+        "method": "GET",
+        "url": "http://172.17.0.1:5000/api/timeline",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "source_id",
+              "value": "={{ $json.id }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "24db6992-fc80-46d2-b98a-45bf41de8cc4",
+      "name": "Classify, Dedupe & Count",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        0
+      ],
+      "notes": "Transition-sum classifier over each event's Frigate timeline (entered_zone entries), replacing the old event.zones-based classifier. See README 'Why event.zones was abandoned' -- event.zones records only each zone's FIRST entry and cannot represent a round trip (out and back in nets to zero crossings recorded, misread as EXIT). Pairs timeline responses back to their source event via pairedItem.item (see 'Fetch Timeline' node notes), not array order.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// --- full-trajectory point-in-polygon classifier ---\n// `entered_zone` timeline entries only fire on a zone TRANSITION -- a track\n// that is already inside a zone on its very first frame never logs one for\n// it. A person leaving from inside the doorway zone, or arriving already\n// inside the doorway zone, can log a single (or zero) `entered_zone` entries\n// and be structurally indistinguishable from noise. The fix: use every\n// timeline entry's `data.box` (visible / entered_zone / gone all carry one),\n// compute the bottom-center point Frigate itself uses for zone membership\n// ((x + w/2, y + h)), and test it against the REAL zone polygons fetched\n// from /api/config -- not a hardcoded x-split, since zone geometry can be\n// retuned at any time.\n\nfunction parseZonePolygons(config) {\n  const cam = config && config.cameras && config.cameras.frontdoor;\n  const zonesCfg = (cam && cam.zones) || {};\n  const detectW = (cam && cam.detect && cam.detect.width) || null;\n  const detectH = (cam && cam.detect && cam.detect.height) || null;\n\n  const polygons = {};\n  for (const [name, zcfg] of Object.entries(zonesCfg)) {\n    const coordStr = zcfg && zcfg.coordinates;\n    if (!coordStr || typeof coordStr !== 'string') continue;\n    const nums = coordStr.split(',').map((s) => Number.parseFloat(s));\n    if (nums.some((n) => Number.isNaN(n))) continue;\n\n    const points = [];\n    for (let i = 0; i + 1 < nums.length; i += 2) points.push([nums[i], nums[i + 1]]);\n\n    // Frigate's zone coordinates are normalized (0-1) in most configs, but\n    // can be stored as absolute pixels against the camera's `detect`\n    // resolution. Detect this from the magnitude rather than assuming.\n    const maxVal = Math.max(...nums);\n    const isAbsolute = maxVal > 1.5;\n    const normPoints = isAbsolute && detectW && detectH\n      ? points.map(([x, y]) => [x / detectW, y / detectH])\n      : points;\n\n    if (normPoints.length >= 3) polygons[name] = normPoints;\n  }\n  return polygons;\n}\n\n// Standard ray-casting point-in-polygon test.\nfunction pointInPolygon(point, polygon) {\n  const [px, py] = point;\n  let inside = false;\n  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {\n    const [xi, yi] = polygon[i];\n    const [xj, yj] = polygon[j];\n    const intersects = (yi > py) !== (yj > py)\n      && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;\n    if (intersects) inside = !inside;\n  }\n  return inside;\n}\n\nfunction zoneForPoint(point, polygons) {\n  for (const [name, poly] of Object.entries(polygons)) {\n    if (pointInPolygon(point, poly)) return name;\n  }\n  return null; // point is outside every configured zone -- not tracked in the sequence\n}\n\n// Build the full-trajectory zone sequence from EVERY timeline entry that\n// carries a box (visible, entered_zone, gone -- not just entered_zone), then\n// collapse consecutive duplicates.\nfunction extractZoneSequence(timelineEntries, polygons) {\n  const ordered = (timelineEntries || [])\n    .filter((e) => e && e.data && Array.isArray(e.data.box) && e.data.box.length === 4)\n    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));\n\n  const raw = [];\n  for (const e of ordered) {\n    const [x, y, w, h] = e.data.box;\n    const bottomCenter = [x + w / 2, y + h];\n    const zone = zoneForPoint(bottomCenter, polygons);\n    if (zone) raw.push(zone);\n  }\n\n  const collapsed = [];\n  for (const z of raw) {\n    if (collapsed.length === 0 || collapsed[collapsed.length - 1] !== z) collapsed.push(z);\n  }\n  return collapsed;\n}\n\nfunction classifyByTransitions(zoneSeq) {\n  let delta = 0;\n  for (let i = 1; i < zoneSeq.length; i++) {\n    const from = zoneSeq[i - 1];\n    const to = zoneSeq[i];\n    if (from === 'approach' && to === 'doorway') delta += 1;\n    else if (from === 'doorway' && to === 'approach') delta -= 1;\n  }\n\n  const distinctZones = new Set(zoneSeq).size;\n  let label;\n  if (distinctZones < 2) label = 'UNCLEAR'; // never crossed -- collapsed sequence is a single zone (or empty)\n  else if (delta > 0) label = 'ENTERED';\n  else if (delta < 0) label = 'LEFT';\n  else label = 'ROUND_TRIP'; // delta==0 but >=2 distinct zones -- e.g. out and back in\n\n  return { delta, label };\n}\n\nfunction applyEvent(state, event, classification, zoneSequence) {\n  const next = { ...state };\n  next.occupancy = Math.max(0, state.occupancy + classification.delta);\n\n  if (classification.label === 'ENTERED') next.entered = state.entered + 1;\n  else if (classification.label === 'LEFT') next.left = state.left + 1;\n  else if (classification.label === 'ROUND_TRIP') next.roundTrips = state.roundTrips + 1;\n  else next.unclear = state.unclear + 1;\n\n  next.lastEvent = {\n    id: event.id != null ? event.id : null,\n    label: classification.label,\n    delta: classification.delta,\n    zoneSequence,\n    start_time: event.start_time != null ? event.start_time : null,\n    end_time: event.end_time != null ? event.end_time : null,\n  };\n  return next;\n}\n\nfunction computeConfidence(state) {\n  const total = state.entered + state.left + state.roundTrips + state.unclear;\n  if (total === 0) return 1;\n  const unclearRatio = state.unclear / total;\n  return Math.max(0, Math.round((1 - unclearRatio) * 100) / 100);\n}\n\n// --- workflow state (n8n static data, persisted across polls) ---\nconst staticData = $getWorkflowStaticData('global');\n\nstaticData.occupancyState = staticData.occupancyState || {\n  occupancy: 0,\n  entered: 0,\n  left: 0,\n  roundTrips: 0,\n  unclear: 0,\n  lastEvent: null,\n  manualOverride: null,\n};\nstaticData.processedIds = staticData.processedIds || [];\nconst MAX_PROCESSED_IDS = 500;\n\n// Zone polygons come from /api/config via the \"Fetch Zone Config\" node,\n// which runs once per poll execution in parallel with the events branch\n// (so it is available even when there are zero new events this poll).\n// Cache the parsed result in static data as a defensive fallback in case\n// that node's output isn't reachable in a given execution context (e.g. a\n// future trigger path that doesn't include it).\nlet polygons;\ntry {\n  const zoneConfigJson = $('Fetch Zone Config').first().json;\n  polygons = parseZonePolygons(zoneConfigJson);\n  if (Object.keys(polygons).length > 0) {\n    staticData.zonePolygons = { fetchedAt: Date.now(), polygons };\n  } else if (staticData.zonePolygons && staticData.zonePolygons.polygons) {\n    polygons = staticData.zonePolygons.polygons;\n  }\n} catch (err) {\n  polygons = (staticData.zonePolygons && staticData.zonePolygons.polygons) || {};\n}\n\n// Pair each timeline HTTP response back to its originating event via\n// pairedItem.item, NOT array order. Verified empirically: without\n// \"fullResponse\" on the \"Fetch Timeline\" node, n8n auto-splits each event's\n// N-entry timeline JSON array into N separate items with sequential (bogus)\n// pairedItem indices -- silently mismatching timeline entries to the wrong\n// event whenever more than one event is in flight in the same poll. With\n// fullResponse:true, \"Fetch Timeline\" emits exactly one output item per input\n// item and pairedItem.item correctly indexes back into \"Prepare New Events\".\nconst preparedEvents = $('Prepare New Events').all();\nconst timelineResponses = $input.all();\n\nconst results = [];\nlet state = staticData.occupancyState;\n\nfor (const resp of timelineResponses) {\n  const srcIdx = resp.pairedItem && resp.pairedItem.item != null ? resp.pairedItem.item : null;\n  const ev = srcIdx != null && preparedEvents[srcIdx] ? preparedEvents[srcIdx].json : null;\n  if (!ev || ev.id == null) continue; // cannot attribute this response to an event; skip defensively\n  if (staticData.processedIds.includes(ev.id)) continue; // already processed (safety net)\n\n  const timelineBody = Array.isArray(resp.json && resp.json.body) ? resp.json.body : [];\n  const zoneSequence = extractZoneSequence(timelineBody, polygons);\n  const classification = classifyByTransitions(zoneSequence);\n\n  state = applyEvent(state, ev, classification, zoneSequence);\n  staticData.processedIds.push(ev.id);\n\n  results.push({\n    json: {\n      eventId: ev.id,\n      label: classification.label,\n      delta: classification.delta,\n      zoneSequence,\n      start_time: ev.start_time,\n      end_time: ev.end_time,\n      occupancy: state.occupancy,\n      entered: state.entered,\n      left: state.left,\n      roundTrips: state.roundTrips,\n      unclear: state.unclear,\n      confidence: computeConfidence(state),\n      snapshotUrl: `http://FRIGATE_LAN_HOST:5000/api/events/${ev.id}/snapshot.jpg`,\n    },\n  });\n}\n\nstaticData.occupancyState = state;\n\nif (staticData.processedIds.length > MAX_PROCESSED_IDS) {\n  staticData.processedIds = staticData.processedIds.slice(-MAX_PROCESSED_IDS);\n}\n\nreturn results;\n"
+      }
+    },
+    {
+      "id": "f1749e88-c1d1-4203-8c3d-cbf9de42e153",
+      "name": "Push to Gotify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        820,
+        0
+      ],
+      "notes": "Auth: Query Auth credential 'Gotify Token' (query param name 'token'). This node runs once per NEW completed event from 'Classify, Dedupe & Count' -- zero items means zero pushes.",
+      "parameters": {
+        "method": "POST",
+        "url": "http://172.17.0.1:8080/message",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"title\": \"Person at front door\",\n  \"message\": $now.setZone('Asia/Jerusalem').toFormat('yyyy-LL-dd HH:mm:ss') + ' \u2014 ' + ({ \"ENTERED\": \"entered\", \"LEFT\": \"left\", \"ROUND_TRIP\": \"went out and came back (net zero)\", \"UNCLEAR\": \"unclear (never crossed a zone boundary)\" }[$json.label] || $json.label) + ' (\u0394' + ($json.delta > 0 ? '+' + $json.delta : $json.delta) + '). Zones: ' + $json.zoneSequence.join(' \u2192 ') + '. Estimated occupancy: ' + $json.occupancy + ' (confidence ' + Math.round($json.confidence * 100) + '%).\\n\\n![snapshot](' + $json.snapshotUrl + ')',\n  \"priority\": 5,\n  \"extras\": { \"client::display\": { \"contentType\": \"text/markdown\" } }\n} }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "",
+          "name": "Gotify Token"
+        }
+      }
+    },
+    {
+      "id": "b1459732-cc6b-412c-b8f4-1680eef451b8",
+      "name": "GET /occupancy",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -680,
+        320
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "occupancy",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "2a94b9b5-cad6-4d54-b1cc-61d207c20c1a",
+      "name": "Read Occupancy State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst state = staticData.occupancyState || {\n  occupancy: 0,\n  entered: 0,\n  left: 0,\n  roundTrips: 0,\n  unclear: 0,\n  lastEvent: null,\n  manualOverride: null,\n};\n\nconst total = state.entered + state.left + state.roundTrips + state.unclear;\nconst confidence = total === 0 ? 1 : Math.max(0, Math.round((1 - state.unclear / total) * 100) / 100);\n\nreturn [\n  {\n    json: {\n      occupancy: state.occupancy,\n      entered: state.entered,\n      left: state.left,\n      roundTrips: state.roundTrips,\n      unclear: state.unclear,\n      confidence,\n      lastEvent: state.lastEvent,\n      manualOverride: state.manualOverride,\n      generatedAt: new Date().toISOString(),\n    },\n  },\n];\n"
+      }
+    },
+    {
+      "id": "7714c0cf-a1f8-48c6-9d98-04592933aed4",
+      "name": "Respond Occupancy",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -200,
+        320
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "f7699a08-4f7b-4bf3-9611-460ca3a6d82f",
+      "name": "GET /occupancy/reset",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -680,
+        600
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "occupancy/reset",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "5c461491-4fc3-4011-b739-a17ba7f365a9",
+      "name": "Apply Manual Reset",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        600
+      ],
+      "notes": "GET /webhook/occupancy/reset?count=N forces occupancy to N (floored at 0). Missing/non-numeric count returns ok:false with HTTP 200 rather than a 4xx -- see README. stats=1 also clears entered/left/roundTrips/unclear.",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nstaticData.occupancyState = staticData.occupancyState || {\n  occupancy: 0,\n  entered: 0,\n  left: 0,\n  roundTrips: 0,\n  unclear: 0,\n  lastEvent: null,\n  manualOverride: null,\n};\n\nconst query = ($input.first().json && $input.first().json.query) || {};\nconst raw = query.count;\nconst parsed = raw !== undefined ? Number.parseInt(raw, 10) : NaN;\n\nif (raw === undefined || Number.isNaN(parsed)) {\n  return [\n    {\n      json: {\n        ok: false,\n        error: \"Missing or invalid 'count' query parameter. Usage: GET /webhook/occupancy/reset?count=0\",\n        occupancy: staticData.occupancyState.occupancy,\n      },\n    },\n  ];\n}\n\nconst floored = Math.max(0, Math.trunc(parsed));\nif (String(query.stats || '') === '1') {\n  staticData.occupancyState.entered = 0;\n  staticData.occupancyState.left = 0;\n  staticData.occupancyState.roundTrips = 0;\n  staticData.occupancyState.unclear = 0;\n  staticData.occupancyState.lastEvent = null;\n}\nstaticData.occupancyState.occupancy = floored;\nstaticData.occupancyState.manualOverride = { value: floored, at: new Date().toISOString() };\n\nreturn [\n  {\n    json: {\n      ok: true,\n      occupancy: staticData.occupancyState.occupancy,\n      entered: staticData.occupancyState.entered,\n      left: staticData.occupancyState.left,\n      roundTrips: staticData.occupancyState.roundTrips,\n      unclear: staticData.occupancyState.unclear,\n      manualOverride: staticData.occupancyState.manualOverride,\n    },\n  },\n];\n"
+      }
+    },
+    {
+      "id": "812003e5-6362-494e-a7c4-3dca221de57f",
+      "name": "Respond Reset",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -200,
+        600
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://172.17.0.1:5000/api/config",
+        "options": {}
+      },
+      "id": "b2c3d4e5-0003-4a00-9000-000000000099",
+      "name": "Fetch Zone Config",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        -440,
+        -220
+      ]
+    }
+  ],
+  "connections": {
+    "Every 10 Seconds": {
+      "main": [
+        [
+          {
+            "node": "Build Poll Query",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch Zone Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Poll Query": {
+      "main": [
+        [
+          {
+            "node": "Fetch Frigate Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Frigate Events": {
+      "main": [
+        [
+          {
+            "node": "Prepare New Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare New Events": {
+      "main": [
+        [
+          {
+            "node": "Fetch Timeline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Timeline": {
+      "main": [
+        [
+          {
+            "node": "Classify, Dedupe & Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify, Dedupe & Count": {
+      "main": [
+        [
+          {
+            "node": "Push to Gotify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET /occupancy": {
+      "main": [
+        [
+          {
+            "node": "Read Occupancy State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Occupancy State": {
+      "main": [
+        [
+          {
+            "node": "Respond Occupancy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET /occupancy/reset": {
+      "main": [
+        [
+          {
+            "node": "Apply Manual Reset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Manual Reset": {
+      "main": [
+        [
+          {
+            "node": "Respond Reset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Zone Config": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
